@@ -13,6 +13,11 @@ void NovofermCover::loop() {
   this->stop_at_target_();
 }
 
+void NovofermCover::update()
+{
+  this->parent_->request_gate_status();
+}
+
 void NovofermCover::setup() {
   this->parent_->add_on_initialized_callback([this]() {
     auto restore = this->restore_state_();
@@ -30,7 +35,10 @@ void NovofermCover::setup() {
       return;
     }
 
-    this->recalibrate_duration_(s);
+    // Learn new open/close cycle times if enabled
+    if (this->learn_cycle_times_) {
+      this->recalibrate_duration_(s);
+    }
 
     ESP_LOGI(TAG, "Status changed from %s to %s", gate_status_to_str(this->current_status_), gate_status_to_str(s));
 
@@ -40,7 +48,6 @@ void NovofermCover::setup() {
         // being opened completely. Sending a pause command after opening fixes
         // that.
         this->parent_->perform_gate_action(GateAction::PAUSE);
-
         this->position = cover::COVER_OPEN;
         break;
       case CLOSED:
@@ -78,7 +85,7 @@ void NovofermCover::control(const cover::CoverCall &call) {
 // Wrap the Cover's publish_state with a rate limiter. Publishes if the last
 // publish was longer than ratelimit milliseconds ago. 0 to disable.
 void NovofermCover::publish_state(bool save, uint32_t ratelimit) {
-  auto now = App.get_loop_component_start_time();
+  auto now = millis();
   if ((now - this->last_publish_time_) < ratelimit) {
     return;
   }
@@ -90,10 +97,6 @@ void NovofermCover::publish_state(bool save, uint32_t ratelimit) {
 // Recalibrate the gate's estimated open or close duration based on the
 // actual time the operation took.
 void NovofermCover::recalibrate_duration_(GateStatus s) {
-  if (this->current_status_ == s) {
-    return;
-  }
-
   auto now = millis();
   auto old = this->current_status_;
 
@@ -214,14 +217,26 @@ void NovofermCover::stop_at_target_() {
   this->target_position_.reset();
 }
 
+void NovofermCover::ventilation_mode(bool active) {
+  ESP_LOGI(TAG, "Setting ventilation mode to: %s", active ? "true" : "false");
+  if (active)
+    this->parent_->perform_gate_action(GateAction::VENTILATE);
+  else
+    this->parent_->perform_gate_action(GateAction::CLOSE);
+}
+
 void NovofermCover::dump_config() {
-  LOG_COVER(TAG, "Tormatic Cover", this);
+  LOG_COVER("", "Novoferm Cover", this);
 
   ESP_LOGCONFIG(TAG,
                 "  Open Duration: %.1fs\n"
                 "  Close Duration: %.1fs",
                 this->open_duration_ / 1e3f, this->close_duration_ / 1e3f);
 
+  LOG_UPDATE_INTERVAL(this);
+  if (this->learn_cycle_times_) {
+    ESP_LOGCONFIG(TAG, "  Learn open/close durations from movement: YES");
+  }
   auto restore = this->restore_state_();
   if (restore.has_value()) {
     ESP_LOGCONFIG(TAG, "  Saved position %d%%", (int) (restore->position * 100.f));

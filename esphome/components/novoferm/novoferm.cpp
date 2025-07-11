@@ -8,105 +8,111 @@
 namespace esphome {
 namespace novoferm {
 
-static const char *const TAG = "novoferm";
-static const int COMMAND_DELAY = 10;
-static const int RECEIVE_TIMEOUT = 200;
+static constexpr const char *const TAG = "novoferm";
+static constexpr int const& RECEIVE_TIMEOUT = 50;
+static constexpr int const& COMMAND_REPLY_TIMEOUT = 500;
 
 void Novoferm::dump_config() {
-  ESP_LOGCONFIG(TAG, "Novoferm:");
+  ESP_LOGCONFIG(TAG, "Novoferm");
   this->check_uart_settings(9600, 1, uart::UART_CONFIG_PARITY_NONE, 8);
 }
 
-// Poll every second
 void Novoferm::setup() {
-  this->set_interval("status_polling", 1000, [this] { this->request_full_status(); });
-}
 
-void Novoferm::request_status(NovofermCommandType type) {}
+}
 
 void Novoferm::request_gate_status() {
   NovofermCommand cmd;
-  cmd.type = NovofermCommandType::GATE_STATUS_REQUEST;
-  cmd.payload = {0x00, 0x0A, 0x00, 0x01};  // GATE + Trailer
-  this->send_command_(cmd);
+  cmd.target = Target::GATE;
+  cmd.action = 0x01;
+  this->enqueue_command_(MessageType::STATUS, cmd);
 }
 
 void Novoferm::request_light_status() {
   NovofermCommand cmd;
-  cmd.type = NovofermCommandType::LIGHT_STATUS_REQUEST;
-  cmd.payload = {0x00, 0x0B, 0x00, 0x01};  // LIGHT + Trailer
-  this->send_command_(cmd);
-}
-
-// Request gate and light status
-void Novoferm::request_full_status() {
-  request_gate_status();
-  request_light_status();
+  cmd.target = Target::LIGHT;
+  cmd.action = 0x01;
+  this->enqueue_command_(MessageType::STATUS, cmd);
 }
 
 void Novoferm::perform_gate_action(GateAction action) {
   NovofermCommand cmd;
-  cmd.type = NovofermCommandType::GATE_CMD;
-  cmd.payload = {0x00, 0x0A, 0x00, action};  // pad + action
-  this->send_command_(cmd);
+  cmd.target = Target::GATE;
+  cmd.action = action;
+  this->enqueue_command_(MessageType::COMMAND, cmd);
+  this->request_gate_status();
 }
 
-void Novoferm::perform_light_action(LightStatus action) {
+void Novoferm::perform_light_action(bool onOff) {
   NovofermCommand cmd;
-  cmd.type = NovofermCommandType::LIGHT_CMD;
-  cmd.payload = {0x00, 0x0B, 0x00, action};  // pad + action
-  this->send_command_(cmd);
+  cmd.target = Target::LIGHT;
+  cmd.action = onOff ? LightStatus::ON : LightStatus::OFF;
+  this->enqueue_command_(MessageType::COMMAND, cmd);
+  this->request_light_status();
 }
 
 void Novoferm::loop() {
   while (this->available()) {
     uint8_t c;
-    this->read_byte(&c);
-    this->handle_char_(c);
+    if (this->read_byte(&c)) {
+      this->handle_char_(c);
+    }
   }
   process_command_queue_();
 }
 
 void Novoferm::handle_char_(uint8_t c) {
-  this->rx_message_.push_back(c);
-  if (!this->validate_message_()) {
-    this->rx_message_.clear();
+  if (rx_buffer_pos_ >= MESSAGE_SIZE) {
+    ESP_LOGW(TAG, "Buffer Overflow, message too long!");
+    rx_buffer_pos_ = 0;
+  }
+
+  // Always add the character tot he buffer
+  rx_buffer_[rx_buffer_pos_++] = c;
+
+  // Validate the message and reset buffer if invalid
+  if (!validate_message_()) {
+    rx_buffer_pos_ = 0;
   } else {
-    this->last_rx_char_timestamp_ = millis();
+    last_rx_char_timestamp_ = millis();
   }
 }
 
 bool Novoferm::validate_message_() {
-  uint32_t at = this->rx_message_.size() - 1;
-  auto *data = &this->rx_message_[0];
-  uint8_t new_byte = data[at];
+  uint8_t at = rx_buffer_pos_ - 1;
+
+  auto *data = &this->rx_buffer_[0];
 
   // Bytes 0-1: SEQ (any) 2–5: LEN (any), Bytes 6-7 Type (validate once 7th is received)
-  if (at <= 6)
+  if (at < 7)
     return true;
 
-  uint16_t seq = (uint16_t(data[0]) << 8) | uint16_t(data[1]);
-  uint32_t len = (uint32_t(data[2]) << 24) | (uint32_t(data[3]) << 16) | (uint32_t(data[4]) << 8) | data[5];
-  uint16_t type = (uint16_t(data[6]) << 8) | uint16_t(data[7]);
-
   // Only validate possible types once
+  uint16_t type = (uint16_t(data[6]) << 8) | uint16_t(data[7]);
   if (at == 7 && !(type == MessageType::STATUS || type == MessageType::COMMAND)) {
-    ESP_LOGW(TAG, "Unexpected TYPE 0x%04X — discarding", type);
+    ESP_LOGW(TAG, "Unexpected TYPE 0x%04X - discarding", type);
     return false;  // reset buffer
   }
 
+  // Check for max payload size
+  uint32_t len = (uint32_t(data[2]) << 24) | (uint32_t(data[3]) << 16) | (uint32_t(data[4]) << 8) | data[5];
+  const auto payloadSize = len - sizeof(type);
+  if (sizeof(MessageHeader) + payloadSize > MESSAGE_SIZE) {
+    ESP_LOGW(TAG, "Payload size %u exceeds max allowed %u - discarding", payloadSize, MESSAGE_SIZE);
+    return false;
+  }
+
   // Wait until all payload bytes have arrived
-  uint32_t payloadSize = len - sizeof(type);
   if (at - 7 < payloadSize) {
     return true;
   }
 
-  // For now just log the message
+  uint16_t seq = (uint16_t(data[0]) << 8) | uint16_t(data[1]);
   const uint8_t *payload = data + 8;
-
   ESP_LOGV(TAG, "Received message: SEQ=%u TYPE=0x%04X PAYLOAD_SIZE=%u PAYLOAD=[%s]", seq, type, payloadSize,
            format_hex_pretty(payload, payloadSize).c_str());
 
+  this->last_full_reply_timestamp_ = millis();
   this->handle_message_(seq, type, payload, payloadSize);
 
   // Returning false here means: reset buffer after processing.
@@ -114,149 +120,118 @@ bool Novoferm::validate_message_() {
 }
 
 void Novoferm::handle_message_(uint16_t seq, uint16_t type, const uint8_t *buffer, uint32_t len) {
-  novoferm::MessageType message_type = (novoferm::MessageType) type;
+   const auto target = this->seq_tx_.extractTarget(seq);
+   const auto messageType = static_cast<MessageType>(type);
 
-  optional<StatusType> expectedStatusType;
-
-  // Find matching expected response by seq and type
-  auto it = std::find_if(expected_responses_.begin(), expected_responses_.end(),
-                         [&](const NovofermExpectedResponse &er) { return er.seq == seq && er.type == message_type; });
-
-  if (it != expected_responses_.end()) {
-    expectedStatusType = it->statusType;
-    expected_responses_.erase(it);
-    if (!command_queue_.empty())
-      command_queue_.erase(command_queue_.begin());
+  if (target == Target::GATE && type == MessageType::STATUS) {
+    handle_gate_status_(reinterpret_cast<const StatusReply*>(buffer));
+  } else if (target == Target::GATE && type == MessageType::COMMAND) {
+    handle_gate_echo_reply(reinterpret_cast<const CommandEchoReply*>(buffer));
+  } else if (target == Target::LIGHT && type == MessageType::STATUS) {
+    handle_light_status_(reinterpret_cast<const StatusReply*>(buffer));
+  } else if (target == Target::LIGHT && type == MessageType::COMMAND) {
+    handle_light_echo_reply(reinterpret_cast<const CommandEchoReply*>(buffer));
+  } else {
+    ESP_LOGE(TAG, "Invalid message handled, implementation issue target=0x%02X messageType=0x%04X",
+         static_cast<unsigned>(target), static_cast<unsigned>(messageType));
   }
+}
 
-  switch (message_type) {
-    case novoferm::MessageType::COMMAND:
-      ESP_LOGD(TAG, "Received command (echo) reply");
-      break;
+void Novoferm::handle_gate_status_(const StatusReply *reply) {
+  ESP_LOGD(TAG, "Received gate status: %s", reply->print(Target::GATE).c_str());
+  if (this->cover_state_callback_) {
+    this->cover_state_callback_(reply->gateState);
+  }
+  if (this->ventilation_state_callback_) {
+    this->ventilation_state_callback_(reply->gateState == GateStatus::VENTILATING);
+  }
+}
 
-    case novoferm::MessageType::STATUS: {
-      if (!expectedStatusType.has_value()) {
-        ESP_LOGE(TAG, "Received STATUS message but expectedStatusType is missing!");
-        break;
+void Novoferm::handle_gate_echo_reply(const CommandEchoReply * reply)
+{
+    ESP_LOGD(TAG, "Received gate cmd reply: %s", reply->print().c_str());
+}
+
+void Novoferm::handle_light_echo_reply(const CommandEchoReply * reply)
+{
+    ESP_LOGD(TAG, "Received light cmd reply: %s", reply->print().c_str());
+}
+
+void Novoferm::handle_light_status_(const StatusReply *reply) {
+  ESP_LOGD(TAG, "Received light status: %s", reply->print(Target::LIGHT).c_str());
+  if (this->light_state_callback_) {
+    this->light_state_callback_(reply->lightState);
+  }
+}
+
+void Novoferm::enqueue_command_(const MessageType type, const NovofermCommand &command) {
+  if (type == MessageType::STATUS) {
+    int pending_count = 0;
+    for (const auto &entry : command_queue_) {
+      if (entry.type == MessageType::STATUS && entry.command.target == command.target) {
+        ++pending_count;
       }
-
-      const StatusReply *reply = reinterpret_cast<const StatusReply *>(buffer);
-      switch (expectedStatusType.value()) {
-        case StatusType::GATE:
-          ESP_LOGD(TAG, "Received gate status: %s", reply->print(StatusType::GATE).c_str());
-          if (this->cover_state_callback_ != nullptr) {
-            this->cover_state_callback_(reply->gateState);
-          }
-          break;
-
-        case StatusType::LIGHT:
-          ESP_LOGD(TAG, "Received light status: %s", reply->print(StatusType::LIGHT).c_str());
-          if (this->light_state_callback_ != nullptr) {
-            this->light_state_callback_(reply->lightState);
-          }
-          break;
-
-        default:
-          ESP_LOGE(TAG, "Received STATUS with unknown StatusType, are we alone?");
-          break;
-      }
-      break;
     }
 
-    default:
-      ESP_LOGE(TAG, "Invalid command received");
-  }
-}
-
-void Novoferm::send_raw_command_(NovofermCommand command) {
-  this->last_command_timestamp_ = millis();
-
-  uint16_t seq = this->next_sequence();  // increment sequence for each command sent
-  uint16_t len = command.payload.size();
-  novoferm::MessageType type = novoferm::MessageType::COMMAND;
-
-  // Set message type and expected response based on easier to use command.type
-  switch (command.type) {
-    case NovofermCommandType::GATE_CMD:
-    case NovofermCommandType::LIGHT_CMD:
-      type = novoferm::MessageType::COMMAND;
-      expected_responses_.push_back({seq, type, nullopt});
-      break;
-    case NovofermCommandType::GATE_STATUS_REQUEST:
-      type = novoferm::MessageType::STATUS;
-      expected_responses_.push_back({seq, type, StatusType::GATE});
-      break;
-    case NovofermCommandType::LIGHT_STATUS_REQUEST:
-      type = novoferm::MessageType::STATUS;
-      expected_responses_.push_back({seq, type, StatusType::LIGHT});
-      break;
-    default:
-      break;
+    if (pending_count == 1) {
+      ESP_LOGV(TAG, "STATUS for target %u already queued - skipping", static_cast<unsigned>(command.target));
+      return;
+    } else if (pending_count > 1) {
+      ESP_LOGW(
+          TAG,
+          "STATUS for target %u already queued (%d pending) - skipping this request."
+          "Consider increasing the send interval if this happens often.",
+          static_cast<unsigned>(command.target),
+          pending_count
+      );
+      return;
+    }
   }
 
-  ESP_LOGV(TAG, "Sending Novoferm: SEQ=%u CMD=0x%02X LEN=%u DATA=[%s]", seq, type, len,
-           format_hex_pretty(command.payload).c_str());
-
-  // Serialize header
-  MessageHeader hdr(type, seq, len);
-  std::vector<uint8_t> message = serialize(hdr);
-
-  // Append payload if present
-  if (!command.payload.empty())
-    message.insert(message.end(), command.payload.begin(), command.payload.end());
-
-  // Write all at once
-  this->write_array(message);
-}
-
-// Put a command into the queue
-void Novoferm::send_command_(const NovofermCommand &command) {
-  command_queue_.push_back(command);
+  command_queue_.push_back({type, command});
   process_command_queue_();
 }
 
+void Novoferm::send_command_(const TXQueueEntry &tx) {
+  uint16_t seq = this->seq_tx_.next(tx.command.target);
+
+  uint8_t* p = this->tx_buffer_;
+  const auto hdr = MessageHeader(tx.type, seq, sizeof(tx.command));
+  hdr.write_to(p);
+  tx.command.write_to(p);
+
+  ESP_LOGV(TAG, "Sending Novoferm: SEQ=%u CMD=0x%02X DATA=[%s]", seq, tx.type,
+           format_hex_pretty(this->tx_buffer_, MESSAGE_SIZE).c_str());
+
+  // Write all at once
+  this->write_array(this->tx_buffer_, MESSAGE_SIZE);
+  this->flush();
+}
+
 void Novoferm::process_command_queue_() {
-  uint32_t now = App.get_loop_component_start_time();
+  const uint32_t now = millis();
 
-  // Clear RX buffer if no chars received recently
-  if (now - this->last_rx_char_timestamp_ > RECEIVE_TIMEOUT) {
-    this->rx_message_.clear();
+  // Check if we are still waiting for a reply to the last command or timed out
+  const bool waitingForReply = (last_command_timestamp_ > last_full_reply_timestamp_);
+
+    // If no chars have been received for a while, clear RX buffer
+  if (waitingForReply && (now - last_rx_char_timestamp_ > RECEIVE_TIMEOUT)) {
+    ESP_LOGD(TAG, "RX buffer cleared due to inactivity");
+    rx_buffer_pos_ = 0;
   }
 
-  // Remove timed out expected responses and corresponding commands
-  while (!expected_responses_.empty()) {
-    const auto &resp = expected_responses_.front();
-    if (now - resp.timestamp > RECEIVE_TIMEOUT) {
-      ESP_LOGW(TAG, "Timeout waiting for response SEQ=%u TYPE=0x%04X - dropping response and command", resp.seq,
-               resp.type);
-      expected_responses_.pop_front();
-
-      if (!command_queue_.empty())
-        command_queue_.erase(command_queue_.begin());
-    } else {
-      // The earliest expected response is still valid
-      break;
-    }
+  if (waitingForReply && (now - last_command_timestamp_ >= COMMAND_REPLY_TIMEOUT)) {
+    ESP_LOGW(TAG, "Timeout waiting for valid reply to last command");
+    rx_buffer_pos_ = 0;
   }
 
-  // Send next command only if:
-  // - enough delay since last command sent
-  // - command queue not empty
-  // - no partial RX message in progress
-  // - no expected responses pending
-  uint32_t delay_since_last_command = now - this->last_command_timestamp_;
-  if (delay_since_last_command > COMMAND_DELAY && !command_queue_.empty() && this->rx_message_.empty() &&
-      expected_responses_.empty()) {
-    const auto &cmd = command_queue_.front();
-
-    ESP_LOGV(TAG, "Sending next command from queue");
-
-    this->send_raw_command_(cmd);
-
-    // If no expected response was registered, remove the command immediately
-    if (expected_responses_.empty())
-      command_queue_.erase(command_queue_.begin());
+  if (command_queue_.empty() || waitingForReply) {
+    return;
   }
+
+  send_command_(command_queue_.front());
+  command_queue_.pop_front();
+  last_command_timestamp_ = now;
 }
 
 }  // namespace novoferm

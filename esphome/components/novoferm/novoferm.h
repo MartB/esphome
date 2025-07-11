@@ -17,6 +17,7 @@ namespace novoferm {
 enum MessageType : uint16_t {
   STATUS = 0x0104,
   COMMAND = 0x0106,
+  MALFORMED = 0x0184,
 };
 
 inline const char *message_type_to_str(MessageType t) {
@@ -30,17 +31,9 @@ inline const char *message_type_to_str(MessageType t) {
   }
 }
 
-// Serialize the given object to a new byte vector.
-template<typename T> std::vector<uint8_t> serialize(T obj) {
-  std::vector<uint8_t> out(sizeof(T));
-  memcpy(out.data(), &obj, sizeof(T));
-  return out;
-}
-
-// StatusType denotes which 'page' of information needs to be retrieved.
-// Novoferm 423, only supports GATE status
+// Novoferm 423, only supports GATE
 // Novoport IV, supports GATE and LIGHT with UNKNOWN being 0x0C
-enum StatusType : uint16_t {
+enum Target : uint16_t {
   GATE = 0x0A,
   LIGHT = 0x0B,
   UNKNOWN = 0x0C,
@@ -82,7 +75,6 @@ enum GateAction : uint8_t {
 };
 
 enum LightStatus : uint8_t { OFF, ON };
-
 inline const char *light_status_to_str(LightStatus s) {
   switch (s) {
     case OFF:
@@ -102,151 +94,226 @@ struct MessageHeader {
 
   MessageHeader() = default;
 
-  MessageHeader(MessageType type, uint16_t seq, uint32_t payload_size) {
-    this->type = convert_big_endian(type);
-    this->seq = convert_big_endian(seq);
-    // len includes the length of the type field
-    this->len = convert_big_endian(payload_size + sizeof(this->type));
-  }
+  MessageHeader(MessageType type, uint16_t seq, uint32_t payload_size)
+      : seq(seq), len(payload_size + sizeof(type)), type(type) {}
 
   std::string print() const {
-    return str_sprintf("MessageHeader: seq %d, len %d, type %s", this->seq, this->len,
-                       message_type_to_str(static_cast<MessageType>(this->type)));
+    return str_sprintf("MessageHeader: seq %u, len %u, type %s",
+                       seq, len, message_type_to_str(type));
   }
 
   // payload_size returns the amount of payload bytes to be read from the uart
-  // buffer after reading the header.
-  uint32_t payload_size() const { return this->len - sizeof(this->type); }
-} __attribute__((packed));
+  uint32_t payload_size() const { return len - sizeof(type); }
 
-template<typename StatusEnum> struct CommandRequestReplyTemplate {
-  StatusType type;
-  uint8_t pad = 0x0;
-  StatusEnum state;
+  // Reads a MessageHeader from the buffer, returns the struct
+  static MessageHeader read_from(const uint8_t* buffer) {
+    uint16_t be_seq;
+    uint32_t be_len;
+    uint16_t be_type;
 
-  CommandRequestReplyTemplate() = default;
-  CommandRequestReplyTemplate(StatusEnum state) : state(state) {}
+    std::memcpy(&be_seq, buffer, sizeof(be_seq));
+    buffer += sizeof(be_seq);
 
-  void byteswap() { this->type = convert_big_endian(this->type); }
+    std::memcpy(&be_len, buffer, sizeof(be_len));
+    buffer += sizeof(be_len);
 
-  std::string print() {
-    if constexpr (std::is_same_v<StatusEnum, GateStatus>) {
-      return str_sprintf("CommandRequestReply: state %s", gate_status_to_str(this->state));
-    } else if constexpr (std::is_same_v<StatusEnum, LightStatus>) {
-      return str_sprintf("CommandRequestReply: state %s", this->state == LightStatus::ON ? "ON" : "OFF");
-    } else {
-      return "CommandRequestReply: unknown state";
-    }
+    std::memcpy(&be_type, buffer, sizeof(be_type));
+    buffer += sizeof(be_type);
+
+    MessageHeader header;
+    header.seq = convert_big_endian(be_seq);
+    header.len = convert_big_endian(be_len);
+    header.type = static_cast<MessageType>(convert_big_endian(be_type));
+
+    return header;
+  }
+
+  void write_to(uint8_t*& buffer) const {
+    uint16_t be_seq  = convert_big_endian(seq);
+    uint32_t be_len  = convert_big_endian(len);
+    uint16_t be_type = convert_big_endian(static_cast<uint16_t>(type));
+
+    std::memcpy(buffer, &be_seq, sizeof(be_seq));
+    buffer += sizeof(be_seq);
+
+    std::memcpy(buffer, &be_len, sizeof(be_len));
+    buffer += sizeof(be_len);
+
+    std::memcpy(buffer, &be_type, sizeof(be_type));
+    buffer += sizeof(be_type);
   }
 } __attribute__((packed));
 
 struct StatusReply {
   uint8_t ack = 0x2;
-  // Only use when gate was requested, else garbage data
   GateStatus gateState;
-  // Only use when light was requested, else garbage data
   LightStatus lightState;
 
-  std::string print(StatusType expected_type) const {
+  // Reads StatusReply from a buffer (must point to at least sizeof(StatusReply) bytes)
+  static StatusReply read_from(const uint8_t* buffer) noexcept {
+    StatusReply reply;
+    reply.ack = buffer[0];
+    reply.gateState = static_cast<GateStatus>(buffer[1]);
+    reply.lightState = static_cast<LightStatus>(buffer[2]);
+    return reply;
+  }
+
+  std::string print(Target expected_type) const {
     switch (expected_type) {
-      case StatusType::GATE:
+      case Target::GATE:
         return str_sprintf("StatusReply: gate state %s", gate_status_to_str(this->gateState));
-      case StatusType::LIGHT:
+      case Target::LIGHT:
         return str_sprintf("StatusReply: light state %s", this->lightState == LightStatus::ON ? "ON" : "OFF");
       default:
         return "StatusReply: unknown status type";
     }
   }
-
 } __attribute__((packed));
+
+struct NovofermCommand {
+  Target target;
+  uint8_t pad = 0x0;
+  uint8_t action;
+
+  NovofermCommand() = default;
+
+  NovofermCommand(Target target, uint8_t action)
+      : target(target), pad(0), action(action) {}
+
+  // Write serialized data into provided buffer (assumes buffer is at least 4 bytes)
+  void write_to(uint8_t*& buffer) const {
+    uint16_t be_target = convert_big_endian(target);
+    std::memcpy(buffer, &be_target, sizeof(be_target));
+    buffer += sizeof(be_target);
+
+    *buffer++ = pad;
+    *buffer++ = action;
+  }
+
+  // Read from buffer to populate fields (buffer must have at least 4 bytes)
+  static NovofermCommand read_from(const uint8_t* buffer) {
+    uint16_t be_target;
+    std::memcpy(&be_target, buffer, sizeof(be_target));
+    return {static_cast<Target>(convert_big_endian(be_target)), buffer[3]};
+  }
+};
+
+// Command tells the gate to start or stop moving.
+// It is echoed back by the unit on success.
+struct CommandEchoReply {
+  Target type;
+  uint16_t state_raw;
+
+  CommandEchoReply() = default;
+  std::string print() const {
+      return str_sprintf("CommandEchoReply: %s",  format_hex_pretty(state_raw).c_str());
+  }
+
+  // Reads CommandEchoReply from buffer (expects at least 4 bytes)
+  static CommandEchoReply read_from(const uint8_t* buffer) noexcept {
+    CommandEchoReply reply;
+
+    uint16_t be_type, be_state;
+    std::memcpy(&be_type, buffer, sizeof(be_type));
+    std::memcpy(&be_state, buffer + sizeof(be_type), sizeof(be_state));
+
+    reply.type = static_cast<Target>(convert_big_endian(be_type));
+    reply.state_raw = convert_big_endian(be_state);
+
+    return reply;
+  }
+} __attribute__((packed));
+
+static constexpr uint8_t MESSAGE_SIZE = sizeof(MessageHeader) + sizeof(NovofermCommand);
 
 // PROTOCOL_DEFINITIONS_END
 
 struct NovofermStatusListener {
-  StatusType type;
+  Target type;
   std::function<void()> on_data;
 };
 
-// Expected response storing type and sequence number
-struct NovofermExpectedResponse {
-  uint16_t seq;
+struct TXQueueEntry {
   MessageType type;
-
-  // Status Type is optional but can be used to check if the proper reply was provided
-  optional<StatusType> statusType;
-  uint32_t timestamp;
-
-  NovofermExpectedResponse() {
-    statusType = nullopt;
-    timestamp = App.get_loop_component_start_time();
-  }
-
-  NovofermExpectedResponse(uint16_t seq, MessageType type, optional<StatusType> statusType = nullopt)
-      : seq(seq), type(type), timestamp(App.get_loop_component_start_time()), statusType(statusType) {}
-};
-
-// Just for easier use
-enum NovofermCommandType {
-  GATE_CMD,
-  LIGHT_CMD,
-  GATE_STATUS_REQUEST,
-  LIGHT_STATUS_REQUEST,
-};
-
-struct NovofermCommand {
-  NovofermCommandType type;
-  std::vector<uint8_t> payload;
+  NovofermCommand command;
 };
 
 class Novoferm : public Component, public uart::UARTDevice {
  public:
-  float get_setup_priority() const override { return setup_priority::LATE; }
+  float get_setup_priority() const override { return setup_priority::BUS - 0.1F; }
   void setup() override;
   void loop() override;
   void dump_config() override;
   void set_cover_state_listener(const std::function<void(GateStatus)> &func) { cover_state_callback_ = func; }
-
   void set_light_state_listener(const std::function<void(LightStatus)> &func) { light_state_callback_ = func; }
+  void set_ventilation_state_listener(const std::function<void(bool)> &func) { ventilation_state_callback_ = func; }
 
   void add_on_initialized_callback(std::function<void()> callback) {
     this->initialized_callback_.add(std::move(callback));
   }
 
   void perform_gate_action(GateAction action);
-  void perform_light_action(LightStatus action);
+  void perform_light_action(bool onOff);
+
+  void request_gate_status();
+  void request_light_status();
 
  protected:
   void handle_char_(uint8_t c);
   bool validate_message_();
 
+  void handle_light_status_(const StatusReply *reply);
+  void handle_gate_status_(const StatusReply *reply);
+  void handle_gate_echo_reply(const CommandEchoReply *reply);
+  void handle_light_echo_reply(const CommandEchoReply *reply);
+
   void handle_message_(uint16_t seq, uint16_t type, const uint8_t *buffer, uint32_t len);
   void process_command_queue_();
 
-  void send_raw_command_(NovofermCommand command);
-  void send_command_(const NovofermCommand &command);
+  void enqueue_command_(const MessageType type, const NovofermCommand &command);
+  void send_command_(const TXQueueEntry &entry);
 
-  void request_gate_status();
-  void request_light_status();
-  void request_status(NovofermCommandType type);
-  void request_full_status();
+  struct Sequence {
+    uint8_t counter;
+    Sequence() : counter(0) {}
 
-  uint16_t next_sequence() {
-    // avoid 0 as sequence number
-    if (++seq_tx_ == 0)
-      seq_tx_ = 1;
-    return seq_tx_;
-  }
-  uint16_t seq_tx_{0};
+    uint16_t next(const Target &target) {
+      counter++;
+      if (counter == 0) counter = 1;
 
-  uint32_t last_command_timestamp_ = 0;
-  uint32_t last_rx_char_timestamp_ = 0;
-  std::vector<uint8_t> rx_message_;
-  std::vector<NovofermCommand> command_queue_;
-  std::deque<NovofermExpectedResponse> expected_responses_;
+      return (static_cast<uint16_t>(target) << 8) | counter;
+    }
+
+    // Extract Target from a raw uint16_t sequence
+    static Target extractTarget(uint16_t buf) {
+        Target tgt = static_cast<Target>((buf >> 8) & 0xFF);
+
+        // validate the target so we dont return invalid enum values
+        switch (tgt) {
+            case Target::GATE:
+            case Target::LIGHT:
+                return tgt;
+            default:
+                return Target::UNKNOWN;
+        }
+    }
+  };
+
+  Sequence seq_tx_;
+  uint32_t last_command_timestamp_{0};
+  uint32_t last_rx_char_timestamp_{0};
+  uint32_t last_full_reply_timestamp_{0};
+
+  uint8_t rx_buffer_[MESSAGE_SIZE + 1];
+  uint8_t rx_buffer_pos_ = 0;
+
+  uint8_t tx_buffer_[MESSAGE_SIZE + 1];
+  std::deque<TXQueueEntry> command_queue_;
 
   CallbackManager<void()> initialized_callback_{};
   std::function<void(GateStatus)> cover_state_callback_ = nullptr;
   std::function<void(LightStatus)> light_state_callback_ = nullptr;
+  std::function<void(bool)> ventilation_state_callback_ = nullptr;
 };
 
 }  // namespace novoferm

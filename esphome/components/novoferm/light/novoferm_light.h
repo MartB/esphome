@@ -7,21 +7,24 @@
 namespace esphome {
 namespace novoferm {
 
-class NovofermLight : public Component, public light::LightOutput {
+class NovofermLight : public PollingComponent, public light::LightOutput {
  public:
   void setup() override;
   void dump_config() override;
+  void update() override;
 
   void set_novoferm_parent(Novoferm *parent) { this->parent_ = parent; }
 
   light::LightTraits get_traits() override;
   void setup_state(light::LightState *state) override;
   void write_state(light::LightState *state) override;
-  LightStatus current_status_{OFF};
 
  protected:
   Novoferm *parent_;
   light::LightState *state_{nullptr};
+  LightStatus current_status_{OFF};
+  bool first_update_received_ = false;
+
 };
 
 }  // namespace novoferm
